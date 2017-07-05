@@ -66,41 +66,52 @@ def update_locations(ex, city):
             )
         page += 1
     return "City {}".format(city.name), [
-        ex.submit(update_measurements, ex, location)
+        ex.submit(update_measurements, ex, location, 10)
         for location in Location.objects.filter(city=city)
     ]
 
 
-def update_measurements(ex, location):
-    page = floor((1 + location.measurements.count()) / ENTRIES_PER_PAGE) + 1
-    result = api.measurements(page=page, limit=ENTRIES_PER_PAGE,
-                              country=location.city.country.code,
-                              city=location.city.name,
-                              location=location.name, sort="asc",
-                              order_by="date")
-    stop = page * result['meta']['limit'] > result['meta']['found']
-    pages = floor(result['meta']['found']/result['meta']['limit']) + 1
-    for measures in result['results']:
-        date = datetime.strptime(measures['date']['utc'],
-                                 '%Y-%m-%dT%H:%M:%S.%fZ')
-        date = date.replace(tzinfo=timezone.utc)
+def update_measurements(ex, location, per_page):
+    page = floor((1 + location.measurements.count()) / per_page) + 1
+    count = 0
+    stop = False
+    while count < per_page and not stop:
+        result = api.measurements(page=page, limit=per_page,
+                                  country=location.city.country.code,
+                                  city=location.city.name,
+                                  location=location.name, sort="asc",
+                                  order_by="date")
+        stop = page * result['meta']['limit'] > result['meta']['found']
+        for measures in result['results']:
+            date = datetime.strptime(measures['date']['utc'],
+                                     '%Y-%m-%dT%H:%M:%S.%fZ')
+            date = date.replace(tzinfo=timezone.utc)
 
-        Measurement.objects.get_or_create(
-            location=location,
-            utc=date,
-            parameter=measures['parameter'],
-            defaults={
-                'parameter': measures['parameter'],
-                'value': measures['value'],
-                'unit': measures['unit'],
-                'utc': date,
-                'location': location
-            }
-        )
+            _, created = Measurement.objects.get_or_create(
+                location=location,
+                utc=date,
+                parameter=measures['parameter'],
+                defaults={
+                    'parameter': measures['parameter'],
+                    'value': measures['value'],
+                    'unit': measures['unit'],
+                    'utc': date,
+                    'location': location
+                }
+            )
+            if created:
+                count += 1
+        page += 1
+
+    page -= 1
+    pages = floor(result['meta']['found'] / result['meta']['limit']) + 1
 
     return (
-        "Location page {}/{} {}".format(page, pages, location.name),
-        [] if stop else [ex.submit(update_measurements, ex, location)]
+        "Location page {}/{} ({}) {}".format(page, pages,
+                                             count, location.name),
+        [] if stop else [
+            ex.submit(update_measurements, ex, location, ENTRIES_PER_PAGE)
+        ]
     )
 
 
@@ -108,10 +119,15 @@ class Command(BaseCommand):
     def handle(self, *args, **options):
         with futures.ThreadPoolExecutor(max_workers=10) as ex:
             tasks = set([ex.submit(update_countries, ex)])
-            while tasks:
-                done, tasks = futures.wait(
-                    tasks, return_when=futures.FIRST_COMPLETED)
-                for f in done:
-                    output, futs = f.result()
-                    tasks |= set(futs)
-                    print("{} {}".format(len(tasks), output))
+            try:
+                while tasks:
+                    done, tasks = futures.wait(
+                        tasks, return_when=futures.FIRST_COMPLETED)
+                    for f in done:
+                        output, futs = f.result()
+                        tasks |= set(futs)
+                        print("{} {}".format(len(tasks), output))
+            except Exception as e:
+                for task in tasks:
+                    task.cancel()
+                raise
